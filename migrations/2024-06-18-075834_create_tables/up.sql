@@ -1,0 +1,43 @@
+CREATE TABLE patients (
+    id SERIAL PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    entry JSONB NOT NULL
+);
+
+CREATE TABLE specimen (
+    id SERIAL PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    entry JSONB NOT NULL
+);
+
+CREATE TABLE conditions (
+    id SERIAL PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    entry JSONB NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION update_last_updated()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.last_updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_last_updated_trigger
+BEFORE UPDATE ON patients
+FOR EACH ROW
+EXECUTE PROCEDURE update_last_updated();
+
+CREATE TRIGGER update_last_updated_trigger
+BEFORE UPDATE ON specimen
+FOR EACH ROW
+EXECUTE PROCEDURE update_last_updated();
+
+CREATE TRIGGER update_last_updated_trigger
+BEFORE UPDATE ON conditions
+FOR EACH ROW
+EXECUTE PROCEDURE update_last_updated();
