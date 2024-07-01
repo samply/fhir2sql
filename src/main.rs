@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use dotenv::dotenv;
 use tokio_postgres::{Client as PgClient, NoTls};
-use tracing::{event, info, warn, error, Level};
+use tracing::{info, warn, error};
 use tracing_subscriber;
 
 
@@ -201,7 +201,7 @@ async fn sync(
                             Some(entries) => entries,
                             None => break
                         };
-                        event!(Level::INFO, "Processing: {}", url);                        
+                        info!("Processing: {}", url);
                         for e in entries {                            
 
                             let blaze_version = get_version(e.resource.clone());
@@ -302,7 +302,7 @@ async fn main() -> Result<(), anyhow::Error>{
     //let args: Vec<String> = env::args().collect();
     /*
     if args.len() != 3 || args[1] != "upsert" {
-        eprintln!("Usage: blaze2pg upsert <type>. \n
+        eprintln!("Usage: fhir2sql upsert <type>. \n
         <type> must be one of observation, patient, specimen, or condition");
         return;
     }
@@ -355,7 +355,7 @@ async fn main() -> Result<(), anyhow::Error>{
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             //eprintln!("connection error: {}", e);
-            event!(Level::ERROR, "Could not connect to PostgreSQL");
+            error!("Could not connect to PostgreSQL: {e}");
         }
     });
     
