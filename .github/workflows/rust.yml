@@ -1,0 +1,24 @@
+name: Build with rust and docker
+
+on:
+  push:
+  workflow_dispatch:
+  pull_request:
+  schedule:
+    # Fetch new base image updates every night at 1am
+    - cron: '0 1 * * *'
+
+jobs:
+  build-with-samply:
+    uses: samply/github-workflows/.github/workflows/rust.yml@main
+    with:
+      image-prefix: "samply/"
+      components: '[ "fhir2sql" ]'
+      #architectures: '[ "amd64", "arm64" ]'
+      #profile: debug
+      test-via-script: false
+      #features: '[ "bbmri", "dktk", "" ]'
+      push-to: ${{ (github.ref_protected == true || github.event_name == 'workflow_dispatch') && 'dockerhub' || 'ghcr' }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
