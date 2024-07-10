@@ -1,0 +1,7 @@
+/target
+.env
+.vscode
+Cargo.lock
+.clj-kondo/
+.lsp/
+Dockerfile_test
