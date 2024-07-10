@@ -2,3 +2,9 @@
 .env
 .vscode
 Cargo.lock
+<<<<<<< HEAD
+=======
+.clj-kondo/
+.lsp/
+Dockerfile_test
+>>>>>>> switch_to_sqlx

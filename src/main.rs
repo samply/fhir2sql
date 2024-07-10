@@ -1,17 +1,21 @@
+mod db_utils;
+use db_utils::*;
+use sqlx::{postgres::PgPoolOptions, PgPool};
+
 use std::collections::BTreeMap;
 use anyhow::bail;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use dotenv::dotenv;
-use tokio_postgres::{Client as PgClient, NoTls};
+use std::env;
 use tracing::{info, warn, error};
 use tracing_subscriber;
+use dotenv::dotenv;
 
 
 #[derive(Deserialize, Serialize)]
 struct Entry {    
-    resource: serde_json::Value, //interpret resource as Value    
+    resource: serde_json::Value,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -68,16 +72,18 @@ pub fn get_version(resource: serde_json::Value) -> Option<ResourceVersion> {
     }
 }
 
-// get BTreeMap of all <resource_id, version_id> pairs in pg for the given resource type
-pub async fn get_pg_resource_versions(table_name: &str, pg_client: &PgClient) -> Result<BTreeMap<String,BTreeMapValue>, anyhow::Error> {
-    let rows = pg_client.query(
-        &format!("SELECT id pk_id, resource::text FROM {};", table_name), &[]).await?;
+// get BTreeMap of all <resource_id, BTreeMapValue> pairs in pg for the given resource type
+pub async fn get_pg_resource_versions(table_name: &str, pg_con_pool: &PgPool) -> Result<BTreeMap<String,BTreeMapValue>, anyhow::Error> {
+    let query = format!("SELECT id pk_id, resource::text FROM {}", table_name);
+    let rows: Vec<(i32, String)> = sqlx::query_as(&query)
+    .fetch_all(pg_con_pool)
+    .await?;
 
     let mut pg_versions = BTreeMap::new();
 
     for row in rows {
-        let pk_id: i32 = row.get("pk_id");        
-        let resource_str: String = row.get("resource");        
+        let pk_id: i32 = row.0;        
+        let resource_str: String = row.1;        
         let resource: serde_json::Value = match serde_json::from_str(&resource_str) {
             Ok(resource) => resource,
             Err(_) => continue
@@ -94,15 +100,13 @@ pub async fn get_pg_resource_versions(table_name: &str, pg_client: &PgClient) ->
     Ok(pg_versions)
 }    
 
-pub async fn update_helper(pg_client: &mut PgClient, items: &[PgUpdateItem], table_name: &str) -> Result<(), anyhow::Error> {
-    let tx = pg_client.transaction().await?;
+pub async fn update_helper(pg_con_pool: &PgPool, items: &[PgUpdateItem], table_name: &str) -> Result<(), sqlx::Error> {
 
     let values: Vec<_> = items
         .into_iter()
         .map(|item| format!("({}, $${}$$)", item.id, item.resource))
         .collect();
 
-    //@todo implement this    
     let query = format!(
         "UPDATE {} SET resource = data.resource::jsonb FROM (VALUES {}) AS data(id, resource) WHERE data.id = {}.id",
         table_name,
@@ -110,14 +114,14 @@ pub async fn update_helper(pg_client: &mut PgClient, items: &[PgUpdateItem], tab
         table_name
     );
 
-    tx.execute(&query, &[]).await?;
-    tx.commit().await?;
+    sqlx::query(&query)
+    .execute(pg_con_pool)
+    .await?;
 
     Ok(())
 }
 
-pub async fn insert_helper(pg_client: &mut PgClient, items: &[PgInsertItem], table_name: &str) -> Result<(), anyhow::Error> {
-    let tx = pg_client.transaction().await?;
+pub async fn insert_helper(pg_con_pool: &PgPool, items: &[PgInsertItem], table_name: &str) -> Result<(), anyhow::Error> {
 
     let values: Vec<_> = items
         .into_iter()
@@ -129,14 +133,14 @@ pub async fn insert_helper(pg_client: &mut PgClient, items: &[PgInsertItem], tab
         table_name,
         values.join(",")        
     );
-    tx.execute(&query, &[]).await?;
-    tx.commit().await?;
 
+    sqlx::query(&query)
+    .execute(pg_con_pool)
+    .await?;
     Ok(())
 }
 
-pub async fn delete_helper(pg_client: &mut PgClient, items: &[i32], table_name: &str) -> Result<(), anyhow::Error> {
-    let tx = pg_client.transaction().await?;
+pub async fn delete_helper(pg_con_pool: &PgPool, items: &[i32], table_name: &str) -> Result<(), anyhow::Error> {
 
     let values: Vec<_> = items
         .into_iter()
@@ -148,20 +152,40 @@ pub async fn delete_helper(pg_client: &mut PgClient, items: &[i32], table_name: 
         table_name,
         values.join(",")        
     );
-    tx.execute(&query, &[]).await?;
-    tx.commit().await?;
+
+    sqlx::query(&query)
+    .execute(pg_con_pool)
+    .await?;
 
     Ok(())
 }
 
+
+/// Synchronizes resources from Blaze to PostgreSQL
+///
+/// pg_versions holds a BTreeMap that is used to look up resource version_ids currently in pg
+/// resource-ids that are found in Blaze but not in pg: will be inserted
+/// resource-ids that are found in Blaze with a different version_id than in pg: will be updated
+/// resource-ids that are found in pg but not in blaze : will be deleted from pg
+/// # Parameters
+///
+/// * `base_url`: The base URL of the Blaze API.
+/// * `pg_client`: A mutable reference to a PostgreSQL client.
+/// * `type_arg`: The type of resource to synchronize (e.g. "specimen", "patient", etc.).
+/// * `batch_size`: The number of resources to process in each batch.
+/// * `page_resource_count`: The number of resources to fetch from Blaze in each page.
+///
+/// # Returns
+///
+/// A `Result` indicating whether the synchronization was successful. If an error occurs, it will be returned as an `anyhow::Error`.
 async fn sync(
         base_url: &str, 
-        pg_client: &mut PgClient, 
+        pg_con_pool: &PgPool, 
         type_arg: &str, 
         batch_size: u32, 
         page_resource_count: u32
     ) -> Result<(), anyhow::Error>{
-
+    
     // set pg table name to insert into or update
     let table_name = match type_arg.to_lowercase().as_str() {
         "specimen" => "specimen",
@@ -177,12 +201,13 @@ async fn sync(
     let mut update_batch: Vec<PgUpdateItem> = Vec::new();
     let mut insert_batch: Vec<PgInsertItem> = Vec::new();
 
-    let mut pg_versions = get_pg_resource_versions(table_name, &pg_client).await?;
+    let mut pg_versions = get_pg_resource_versions(table_name, pg_con_pool).await?;
     
     let client = Client::new();
-    let mut url: String = format!("{}{}?_count={}", base_url, type_arg, page_resource_count);
+    let mut url: String = format!("{}{}?_count={}&_history=current", base_url, type_arg, page_resource_count);
     let mut update_counter: u32 = 0;    
-    let mut insert_counter: u32 = 0;    
+    let mut insert_counter: u32 = 0;
+    info!("Attempting to sync: {}", &type_arg);    
     loop {
         let res = client.get(&url).send().await;
         match res {            
@@ -190,7 +215,7 @@ async fn sync(
                 let res_text = match res.text().await {
                     Ok(text) => text,
                     Err(err) => {
-                        error!("failed to get payload: {}", err);
+                        error!("Failed to get payload: {}", err);
                         break;
                     }
                 };      
@@ -199,53 +224,56 @@ async fn sync(
                     Ok(search_set) => {
                         let entries = match search_set.entry {
                             Some(entries) => entries,
-                            None => break
-                        };
-                        info!("Processing: {}", url);
+                            None => {
+                                warn!("Could not read entries from search set.");
+                                break;
+                            }
+                        };                        
                         for e in entries {                            
 
                             let blaze_version = get_version(e.resource.clone());
                             let blaze_version = match blaze_version {
                                 Some(v) => v,
-                                None => {
-                                    //@todo: log stuff (to pg?) and
+                                None => {                                    
+                                    warn!("Could not read resource version from Blaze search set entry.");
                                     continue
                                 }
                             };
                                                         
                             let resource_str = match serde_json::to_string(&e.resource) {
                                 Ok(s) => s,
-                                Err(e) => {
-                                    //@todo: log error
-                                    "{}".to_string()  // use empty JSON object 
+                                Err(_) => {
+                                    "{}".to_string() 
                                 }
                             };
 
                             match pg_versions.get(&blaze_version.resource_id) {
-                                Some(pg_version) => { //resource is already in pg
-                                    if pg_version.version_id < blaze_version.version_id {
+                                Some(pg_version) => { //Resource is already in pg
+                                    if pg_version.version_id < blaze_version.version_id ||
+                                        pg_version.version_id > blaze_version.version_id
+                                    {
                                         //Resource exists in pg but is outdated. 
-                                        //Add e.resource for batch upsert into pg
+                                        //Add resource for batch update into pg
                                         update_counter += 1;                                        
                                         update_batch.push(PgUpdateItem {id: pg_version.pk_id, resource: resource_str.clone()});
-                                        //remove all entries from pg_versions that can be found in Blaze 
+                                        //Remove all entries from pg_versions that can be found in Blaze 
                                         //=> remaining ones need to be deleted from pg
                                         pg_versions.remove(&blaze_version.resource_id);  
                                     }                                    
                                 },
                                 None => { // current resource not (yet) in pg
-                                    //@todo: e.resource for batch insert into pg
+                                    //Add resource for batch insert into pg
                                         insert_counter += 1;                                    
                                         insert_batch.push(PgInsertItem {resource: resource_str.clone()});                                    
                                 }
                             }
 
                             if update_counter > 0 && update_counter % batch_size == 0 {
-                                update_helper(pg_client, &update_batch, table_name).await?;
+                                update_helper(pg_con_pool, &update_batch, table_name).await?;
                                 update_batch.clear();
 
                             } else if insert_counter > 0 && insert_counter % batch_size == 0 {
-                                insert_helper(pg_client, &insert_batch, table_name).await?;
+                                insert_helper(pg_con_pool, &insert_batch, table_name).await?;
                                 insert_batch.clear();
 
                             }
@@ -262,103 +290,93 @@ async fn sync(
                             break;
                         }
                     },
-                    Err(error) => {
-                        bail!("Error deserializing JSON: {}", error);  //@todo: log
+                    Err(err) => {
+                        error!("Could not deserialize JSON to SearchSet: {}", err);
+                        break;
                     }
                 }
             },
             //no valid search response from Blaze
             Err(err) => {                 
-                eprintln!("Failed to get response from Blaze: {}", err);  //@todo: log
+                error!("Failed to get response from Blaze: {}", err);
                 break;
             }
         }
     }
     //insert or update the last remaining resources
     if update_batch.len() > 0 {
-        update_helper(pg_client, &update_batch, table_name).await?;
+        update_helper(pg_con_pool, &update_batch, table_name).await?;
     }
     if insert_batch.len() > 0 {
-        insert_helper(pg_client, &insert_batch, table_name).await?;       
+        insert_helper(pg_con_pool, &insert_batch, table_name).await?;       
     }
     //remove rows from pg that were not encountered in blaze
     let delete_ids: Vec<i32> = pg_versions.values().map(|value| value.pk_id).collect();
     if delete_ids.len() > 0 {
-        delete_helper(pg_client, &delete_ids, table_name).await?;
-    }
-    
+        delete_helper(pg_con_pool, &delete_ids, table_name).await?;
+    }    
     Ok(())
 }
 
-//@todo: add check whether to number of blaze resources exactly matches the number of resources in pg after inserts
+
+//@todo: add check whether to number of blaze resources exactly matches the number of resources in pg after inserts/updates/deletes
+//@todo: add main loop that performs sync, sleeps and exits gracefully
+//@todo: check blaze and pg connections and retry if connection can't be established
+pub async fn main_loop(pg_con_pool: &PgPool, blaze_base_url: &str) -> Result<(), anyhow::Error>{
+    let type_args: Vec<&str> = vec!["Specimen", "Patient", "Observation", "Condition"];
+
+    let page_resource_count = 1000; //the number of resources to return per page by blaze
+    let batch_size = 10000; //the number of resources to insert or update per batch in PostgreSQL
+    let table_names: Vec<&str> = vec!["specimen", "patients", "observations", "conditions"];
+    
+    let all_tables_exist = pred_tables_exist(pg_con_pool, &table_names).await?;
+    if all_tables_exist {
+        info!("All tables found as expected");
+        for type_arg in type_args {
+            sync(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
+        }
+    } else {
+        create_tables(pg_con_pool).await?;
+        for type_arg in type_args {
+            sync(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
+        }
+    }
+    Ok(())
+}
+
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error>{
-    // Initialize tracing subscriber
+
     tracing_subscriber::fmt()
     .with_max_level(tracing::Level::INFO)
     .init();
 
-    //let args: Vec<String> = env::args().collect();
-    /*
-    if args.len() != 3 || args[1] != "upsert" {
-        eprintln!("Usage: fhir2sql upsert <type>. \n
-        <type> must be one of observation, patient, specimen, or condition");
-        return;
-    }
-    let type_arg = &args[2];
-    // Call your upsert function with the type argument
-    upsert(type_arg);
-    */
-    //@todo: add error handling and stuff
-    let type_arg = "Specimen";
-
     dotenv().ok();
 
-    let blaze_base_url: String = dotenv::var("BLAZE_BASE_URL").expect("BLAZE_BASE_URL must be set");
-    let host = dotenv::var("PG_HOST").expect("PG_HOST must be set");
-    let port = dotenv::var("PG_PORT").expect("PG_PORT must be set");
-    let username = dotenv::var("PG_USERNAME").expect("PG_USERNAME must be set");
-    let password = dotenv::var("PG_PASSWORD").expect("PG_PASSWORD must be set"); //@todo: move out of .env
-    let dbname = dotenv::var("PG_DBNAME").expect("PG_DBNAME must be set");        
-    let batch_size = match dotenv::var("PG_BATCH_SIZE") {
-        Ok(val) => match val.parse::<u32>() {
-            Ok(num) => num,
-            Err(_) => {
-                eprintln!("PG_BATCH_SIZE must be a positive number. Using default value.");
-                10000 // default value if parsing fails
-            }
-        },
-        Err(_) => {
-            eprintln!("PG_BATCH_SIZE must be set. Using default value.");
-            10000 // default value if env var is not set
-        }
-    };
-    let page_resource_count = match dotenv::var("BLAZE_PAGE_RESOURCE_COUNT") {
-        Ok(val) => match val.parse::<u32>() {
-            Ok(num) => num,
-            Err(_) => {
-                eprintln!("BLAZE_PAGE_RESOURCE_COUNT not set. Using default value.");
-                100 // default value if parsing failsf
-            }
-        },
-        Err(_) => {
-            eprintln!("BLAZE_PAGE_RESOURCE_COUNT not set. Using default value.");
-            100 // default value if env var is not set
-        }
-    };
+    //@todo: make use of clap crate?    
+    let blaze_base_url: String = env::var("BLAZE_BASE_URL").expect("BLAZE_BASE_URL must be set");
+    let host_name = env::var("PG_HOST").expect("PG_HOST must be set");
+    let user_name = env::var("PG_USERNAME").expect("PG_USERNAME must be set");
+    let password = env::var("PG_PASSWORD").expect("PG_PASSWORD must be set");
+    let db_name = env::var("PG_DBNAME").expect("PG_DBNAME must be set");        
+    let port: u16 = 5432;
 
-    let con_str = &format!("host={} port={} user={} password={} dbname={}", host, port, username, password, dbname);
-    let (mut client, connection) =
-    tokio_postgres::connect(&con_str, NoTls).await?;
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            //eprintln!("connection error: {}", e);
-            error!("Could not connect to PostgreSQL: {e}");
-        }
-    });
+    info!("fhir2sql started"); //@todo: replace with proper banner
     
-    sync(&blaze_base_url, &mut client, type_arg, batch_size, page_resource_count).await?;
+    let pg_url = format!("postgresql://{}:{}@{}:{}/{}", user_name, password, host_name, port, db_name);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let pg_con_pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&pg_url)
+        .await
+        .map_err(|err| {
+            error!("Failed to connect to PostgreSQL: {}", err);
+            anyhow::Error::new(err)
+        })?;
+
+
+    main_loop(&pg_con_pool, &blaze_base_url).await?;
     Ok(())    
 }
