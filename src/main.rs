@@ -1,10 +1,9 @@
 mod db_utils;
-use db_utils::*;
+mod graceful_shutdown;
 
-use tokio::prelude::*;
-use tokio::time::{interval, Duration};
-use tokio::signal::unix::{signal, SignalKind};
-use ctrlc;
+use db_utils::*;
+use tokio::select;
+use tokio::time::{interval, Duration, sleep_until, Instant};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use anyhow::bail;
@@ -12,9 +11,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::env;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use tracing_subscriber;
 use dotenv::dotenv;
+use chrono::{NaiveTime, Timelike, Utc};
 
 #[derive(Deserialize, Serialize)]
 struct Entry {    
@@ -324,8 +324,7 @@ async fn sync(
 
 
 //@todo: add check whether to number of blaze resources exactly matches the number of resources in pg after inserts/updates/deletes
-//@todo: add main loop that performs sync, sleeps and exits gracefully
-pub async fn main_loop(pg_con_pool: &PgPool, blaze_base_url: &str) -> Result<(), anyhow::Error>{
+pub async fn run_sync(pg_con_pool: &PgPool, blaze_base_url: &str) -> Result<(), anyhow::Error>{
     let type_args: Vec<&str> = vec!["Specimen", "Patient", "Observation", "Condition"];
 
     let page_resource_count = 1000; //the number of resources to return per page by blaze
@@ -361,7 +360,7 @@ async fn main() -> Result<(), anyhow::Error>{
 
     dotenv().ok();
 
-    //@todo: make use of clap crate?    
+    //@todo: make use of clap crate? 
     let blaze_base_url: String = env::var("BLAZE_BASE_URL").expect("BLAZE_BASE_URL must be set");
     let host_name = env::var("PG_HOST").expect("PG_HOST must be set");
     let user_name = env::var("PG_USERNAME").expect("PG_USERNAME must be set");
@@ -372,9 +371,53 @@ async fn main() -> Result<(), anyhow::Error>{
     info!("fhir2sql started"); //@todo: replace with proper banner
     
     let pg_url = format!("postgresql://{}:{}@{}:{}/{}", user_name, password, host_name, port, db_name);
-
     let pg_con_pool = get_pg_connection_pool(&pg_url, 10).await?;
+    
+    info!("Running initial sync");
+    match run_sync(&pg_con_pool, &blaze_base_url).await {
+        Ok(()) => {
+            info!("Sync run successfull");
+        },
+        Err(err) => {
+            error!("Sync run unsuccessfull: {}", err);
+        }
+    }
 
-    main_loop(&pg_con_pool, &blaze_base_url).await?;
+    // main loop
+    let mut interval = interval(Duration::from_secs(60)); // execute every 1 minute
+    //@todo: move target_time param somewhere else?
+    let target_time = match NaiveTime::from_hms_opt(3, 0, 0) {
+        Some(time) => time,
+        None => {
+            error!("Invalid target time");
+            return Err(anyhow::Error::msg("Invalid target time"));
+        }
+    };
+
+    loop {
+        select! {
+            _ = interval.tick() => {                
+                let now = Utc::now().naive_local().time();                                
+                if now.hour() == target_time.hour() && now.minute() == target_time.minute() {
+                    info!("Syncing at target time");
+                    match run_sync(&pg_con_pool, &blaze_base_url).await {
+                        Ok(()) => {
+                            info!("Sync run successfull");
+                        },
+                        Err(err) => {
+                            error!("Sync run unsuccessfull: {}", err);
+                        }
+                    }
+                }
+            } _ = graceful_shutdown::wait_for_signal() => {                
+                break;                
+            }
+            _ = async {                
+                let instant = Instant::now() + chrono::Duration::seconds(60).to_std().unwrap();
+                sleep_until(instant).await;
+            } => {}
+        }
+    }
+
     Ok(())    
 }
