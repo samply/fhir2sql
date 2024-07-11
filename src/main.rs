@@ -1,7 +1,11 @@
 mod db_utils;
 use db_utils::*;
-use sqlx::{postgres::PgPoolOptions, PgPool};
 
+use tokio::prelude::*;
+use tokio::time::{interval, Duration};
+use tokio::signal::unix::{signal, SignalKind};
+use ctrlc;
+use sqlx::PgPool;
 use std::collections::BTreeMap;
 use anyhow::bail;
 use reqwest::Client;
@@ -11,7 +15,6 @@ use std::env;
 use tracing::{info, warn, error};
 use tracing_subscriber;
 use dotenv::dotenv;
-
 
 #[derive(Deserialize, Serialize)]
 struct Entry {    
@@ -204,7 +207,8 @@ async fn sync(
     let mut pg_versions = get_pg_resource_versions(table_name, pg_con_pool).await?;
     
     let client = Client::new();
-    let mut url: String = format!("{}{}?_count={}&_history=current", base_url, type_arg, page_resource_count);
+    let mut url: String = format!("{}/fhir/{}?_count={}&_history=current",
+        base_url, type_arg, page_resource_count);
     let mut update_counter: u32 = 0;    
     let mut insert_counter: u32 = 0;
     info!("Attempting to sync: {}", &type_arg);    
@@ -321,7 +325,6 @@ async fn sync(
 
 //@todo: add check whether to number of blaze resources exactly matches the number of resources in pg after inserts/updates/deletes
 //@todo: add main loop that performs sync, sleeps and exits gracefully
-//@todo: check blaze and pg connections and retry if connection can't be established
 pub async fn main_loop(pg_con_pool: &PgPool, blaze_base_url: &str) -> Result<(), anyhow::Error>{
     let type_args: Vec<&str> = vec!["Specimen", "Patient", "Observation", "Condition"];
 
@@ -329,13 +332,17 @@ pub async fn main_loop(pg_con_pool: &PgPool, blaze_base_url: &str) -> Result<(),
     let batch_size = 10000; //the number of resources to insert or update per batch in PostgreSQL
     let table_names: Vec<&str> = vec!["specimen", "patients", "observations", "conditions"];
     
+    //check preconditions for sync
+    //@todo: move param somewhere else?
+    let blaze_available = check_blaze_connection(blaze_base_url, 10).await?;
     let all_tables_exist = pred_tables_exist(pg_con_pool, &table_names).await?;
-    if all_tables_exist {
-        info!("All tables found as expected");
+
+    if blaze_available && all_tables_exist {
+        info!("All tables found as expected \u{2705}");
         for type_arg in type_args {
             sync(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
         }
-    } else {
+    } else if blaze_available && !all_tables_exist {
         create_tables(pg_con_pool).await?;
         for type_arg in type_args {
             sync(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
@@ -365,17 +372,8 @@ async fn main() -> Result<(), anyhow::Error>{
     info!("fhir2sql started"); //@todo: replace with proper banner
     
     let pg_url = format!("postgresql://{}:{}@{}:{}/{}", user_name, password, host_name, port, db_name);
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let pg_con_pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&pg_url)
-        .await
-        .map_err(|err| {
-            error!("Failed to connect to PostgreSQL: {}", err);
-            anyhow::Error::new(err)
-        })?;
-
+    let pg_con_pool = get_pg_connection_pool(&pg_url, 10).await?;
 
     main_loop(&pg_con_pool, &blaze_base_url).await?;
     Ok(())    
