@@ -80,7 +80,7 @@ pub async fn pred_tables_exist(pg_con_pool: &PgPool, table_names: &Vec<&str>) ->
     Ok(all_tables_exist)
 }
 
-
+//create necessary tables and triggers in pg if they don't exist yet
 pub async fn create_tables(pg_con_pool: &PgPool) -> Result<(), anyhow::Error> {
     info!("Creating PostgreSQL tables");
 

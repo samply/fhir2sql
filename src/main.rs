@@ -18,7 +18,18 @@ use tracing_subscriber;
 use dotenv::dotenv;
 use chrono::{NaiveTime, Timelike, Utc};
 
-
+pub struct Config {
+    blaze_base_url: String,
+    pg_host: String,
+    pg_username: String,
+    pg_password: String,
+    pg_dbname: String,
+    pg_port: u16,
+    pg_batch_size: u32,
+    blaze_page_resource_count: u32,
+    blaze_num_connection_attempts: u32,
+    target_time: NaiveTime,
+}
 
 // read id and version_id from a resource if possible
 pub fn get_version(resource: serde_json::Value) -> Option<ResourceVersion> {
@@ -325,27 +336,35 @@ async fn sync_blaze_2_pg(
 }
 
 
-pub async fn run_sync(pg_con_pool: &PgPool, blaze_base_url: &str) -> Result<(), anyhow::Error>{
+pub async fn run_sync(pg_con_pool: &PgPool, config: &Config) -> Result<(), anyhow::Error>{
     let type_args: Vec<&str> = vec!["Specimen", "Patient", "Observation", "Condition"];
 
-    let page_resource_count = 5000; //the number of resources to return per page by blaze
-    let batch_size = 10000; //the number of resources to insert or update per batch in PostgreSQL
     let table_names: Vec<&str> = vec!["specimen", "patients", "observations", "conditions"];
     
     //check preconditions for sync
     //@todo: move num_attempts param somewhere else?
-    let blaze_available = check_blaze_connection(blaze_base_url, 10).await?;
+    let blaze_available = check_blaze_connection(&config.blaze_base_url, 10).await?;
     let all_tables_exist = pred_tables_exist(pg_con_pool, &table_names).await?;
 
     if blaze_available && all_tables_exist {
         info!("All tables found as expected");
         for type_arg in type_args {
-            sync_blaze_2_pg(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
+            sync_blaze_2_pg(
+                &config.blaze_base_url,
+                pg_con_pool, 
+                type_arg,
+                config.pg_batch_size, 
+                config.blaze_page_resource_count).await?;
         }
     } else if blaze_available && !all_tables_exist {
         create_tables(pg_con_pool).await?;
         for type_arg in type_args {
-            sync_blaze_2_pg(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
+            sync_blaze_2_pg(
+                &config.blaze_base_url,
+                pg_con_pool,
+                type_arg,
+                config.pg_batch_size,
+                config.blaze_page_resource_count).await?;
         }
     }
     Ok(())
@@ -362,20 +381,37 @@ async fn main() -> Result<(), anyhow::Error>{
     dotenv().ok();
 
     //@todo: make use of clap crate? 
-    let blaze_base_url: String = env::var("BLAZE_BASE_URL").expect("BLAZE_BASE_URL must be set");
-    let host_name = env::var("PG_HOST").expect("PG_HOST must be set");
-    let user_name = env::var("PG_USERNAME").expect("PG_USERNAME must be set");
-    let password = env::var("PG_PASSWORD").expect("PG_PASSWORD must be set");
-    let db_name = env::var("PG_DBNAME").expect("PG_DBNAME must be set");        
-    let port: u16 = 5432;
+    let config = Config {
+        blaze_base_url: env::var("BLAZE_BASE_URL").expect("BLAZE_BASE_URL must be set"),
+        pg_host: env::var("PG_HOST").expect("PG_HOST must be set"),
+        pg_username: env::var("PG_USERNAME").expect("PG_USERNAME must be set"),
+        pg_password: env::var("PG_PASSWORD").expect("PG_PASSWORD must be set"),
+        pg_dbname: env::var("PG_DBNAME").expect("PG_DBNAME must be set"),
+        pg_port: 5432,
+        pg_batch_size: 10000,
+        blaze_page_resource_count: 5000,
+        blaze_num_connection_attempts: 20,
+        target_time: match NaiveTime::from_hms_opt(3, 0, 0) {
+            Some(time) => time,
+            None => {
+                error!("Invalid target time");
+                return Err(anyhow::Error::msg("Invalid target time"));
+            }
+        }
+    };
 
     info!("fhir2sql started"); //@todo: replace with proper banner
     
-    let pg_url = format!("postgresql://{}:{}@{}:{}/{}", user_name, password, host_name, port, db_name);
+    let pg_url = format!("postgresql://{}:{}@{}:{}/{}", 
+        config.pg_username, 
+        config.pg_password, 
+        config.pg_host, 
+        config.pg_port, 
+        config.pg_dbname);
     let pg_con_pool = get_pg_connection_pool(&pg_url, 10).await?;
     
     info!("Running initial sync");
-    match run_sync(&pg_con_pool, &blaze_base_url).await {
+    match run_sync(&pg_con_pool, &config).await {
         Ok(()) => {
             info!("Sync run successfull");
         },
@@ -387,22 +423,14 @@ async fn main() -> Result<(), anyhow::Error>{
     // main loop
     info!("Entering regular sync schedule");
     let mut interval = interval(Duration::from_secs(60)); // execute every 1 minute
-    //@todo: move target_time param somewhere else?
-    let target_time = match NaiveTime::from_hms_opt(3, 0, 0) {
-        Some(time) => time,
-        None => {
-            error!("Invalid target time");
-            return Err(anyhow::Error::msg("Invalid target time"));
-        }
-    };
-
+    
     loop {
         select! {
-            _ = interval.tick() => {                
+            _ = interval.tick() => {                  
                 let now = Utc::now().naive_local().time();                                
-                if now.hour() == target_time.hour() && now.minute() == target_time.minute() {
+                if now.hour() == config.target_time.hour() && now.minute() == config.target_time.minute() {
                     info!("Syncing at target time");
-                    match run_sync(&pg_con_pool, &blaze_base_url).await {
+                    match run_sync(&pg_con_pool, &config).await {
                         Ok(()) => {
                             info!("Sync run successfull");
                         },
@@ -414,10 +442,6 @@ async fn main() -> Result<(), anyhow::Error>{
             } _ = graceful_shutdown::wait_for_signal() => {                
                 break;                
             }
-            _ = async {                
-                let instant = Instant::now() + chrono::Duration::seconds(60).to_std().unwrap();
-                sleep_until(instant).await;
-            } => {}
         }
     }
 
