@@ -1,14 +1,16 @@
 mod db_utils;
 mod graceful_shutdown;
+mod models;
 
 use db_utils::*;
+use models::*;
+
 use tokio::select;
 use tokio::time::{interval, Duration, sleep_until, Instant};
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 use anyhow::bail;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use serde_json;
 use std::env;
 use tracing::{error, info, warn};
@@ -16,52 +18,7 @@ use tracing_subscriber;
 use dotenv::dotenv;
 use chrono::{NaiveTime, Timelike, Utc};
 
-#[derive(Deserialize, Serialize)]
-struct Entry {    
-    resource: serde_json::Value,
-}
 
-#[derive(Deserialize, Serialize)]
-struct Search {
-    mode: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct SearchSet {
-    id: String,
-    #[serde(rename = "type")]
-    type_: String,
-    entry: Option<Vec<Entry>>,
-    link: Vec<Link>,
-    total: u32,
-    #[serde(rename = "resourceType")]
-    resource_type: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Link {
-    relation: String,
-    url: String,
-}
-
-pub struct ResourceVersion {
-    resource_id: String,
-    version_id: i64
-}
-
-pub struct BTreeMapValue {
-    pk_id: i32, //pg row primary key. Needed for upsert
-    version_id: i64 //resource version_id
-}
-
-pub struct PgInsertItem {    
-    resource: String
-}
-
-pub struct PgUpdateItem {
-    id: i32,    
-    resource: String
-}
 
 // read id and version_id from a resource if possible
 pub fn get_version(resource: serde_json::Value) -> Option<ResourceVersion> {
@@ -103,6 +60,7 @@ pub async fn get_pg_resource_versions(table_name: &str, pg_con_pool: &PgPool) ->
     Ok(pg_versions)
 }    
 
+//do a batch update of pg rows
 pub async fn update_helper(pg_con_pool: &PgPool, items: &[PgUpdateItem], table_name: &str) -> Result<(), sqlx::Error> {
 
     let values: Vec<_> = items
@@ -124,6 +82,7 @@ pub async fn update_helper(pg_con_pool: &PgPool, items: &[PgUpdateItem], table_n
     Ok(())
 }
 
+//do a batch insert of pg rows
 pub async fn insert_helper(pg_con_pool: &PgPool, items: &[PgInsertItem], table_name: &str) -> Result<(), anyhow::Error> {
 
     let values: Vec<_> = items
@@ -143,6 +102,7 @@ pub async fn insert_helper(pg_con_pool: &PgPool, items: &[PgInsertItem], table_n
     Ok(())
 }
 
+//do a batch delete of pg rows
 pub async fn delete_helper(pg_con_pool: &PgPool, items: &[i32], table_name: &str) -> Result<(), anyhow::Error> {
 
     let values: Vec<_> = items
@@ -173,10 +133,9 @@ pub async fn get_num_rows(pg_con_pool: &PgPool, table_name: &str) -> Result<i64,
     Ok(count)
 }
 
-//get the number of resources of a specific type from blaze
-pub async fn get_blaze_resource_count(blaze_base_url: &str, type_arg: &str) -> Result<i64, anyhow::Error> {
+pub async fn get_blaze_search_set(url: &str) -> Result<SearchSet, anyhow::Error> {
     let client = Client::new();
-    let res = client.get(format!("{}/fhir/{}?_count=0", blaze_base_url, type_arg)).send().await;
+    let res = client.get(url).send().await;
     match res {            
         Ok(res) => {                
             let res_text = match res.text().await {
@@ -189,7 +148,7 @@ pub async fn get_blaze_resource_count(blaze_base_url: &str, type_arg: &str) -> R
             let search_set: Result<SearchSet, serde_json::Error> = serde_json::from_str(&res_text); 
             match search_set {
                 Ok(search_set) => {
-                    Ok(search_set.total as i64)
+                    Ok(search_set)
                 } Err(err) => {
                     error!("Could not deserialize JSON to SearchSet: {}", err);
                     Err(anyhow::Error::new(err))
@@ -202,6 +161,17 @@ pub async fn get_blaze_resource_count(blaze_base_url: &str, type_arg: &str) -> R
             Err(anyhow::Error::new(err))
         }
     }
+}
+
+//get the number of resources of a specific type from blaze
+pub async fn get_blaze_resource_count(blaze_base_url: &str, type_arg: &str) -> Result<i64, anyhow::Error> {
+
+    match get_blaze_search_set(&format!("{}/fhir/{}?_count=0", blaze_base_url, type_arg)).await {
+        Ok(search_set) => {
+            Ok(search_set.total as i64)
+        },
+        Err(err) => Err(err)
+    }    
 }
 
 /// Synchronizes resources from Blaze to PostgreSQL
@@ -222,13 +192,13 @@ pub async fn get_blaze_resource_count(blaze_base_url: &str, type_arg: &str) -> R
 ///
 /// A `Result` indicating whether the synchronization was successful. If an error occurs, it will be returned as an `anyhow::Error`.
 async fn sync_blaze_2_pg(
-        blaze_base_url: &str, 
-        pg_con_pool: &PgPool, 
-        type_arg: &str, 
-        batch_size: u32, 
-        page_resource_count: u32
-    ) -> Result<(), anyhow::Error>{
-    
+    blaze_base_url: &str, 
+    pg_con_pool: &PgPool, 
+    type_arg: &str, 
+    batch_size: u32, 
+    page_resource_count: u32
+) -> Result<(), anyhow::Error>{
+
     // set pg table name to insert into or update
     let table_name = match type_arg.to_lowercase().as_str() {
         "specimen" => "specimen",
@@ -245,108 +215,82 @@ async fn sync_blaze_2_pg(
     let mut insert_batch: Vec<PgInsertItem> = Vec::new();
 
     let mut pg_versions = get_pg_resource_versions(table_name, pg_con_pool).await?;
-    
-    let client = Client::new();
+
     let mut url: String = format!("{}/fhir/{}?_count={}&_history=current",
         blaze_base_url, type_arg, page_resource_count);
     let mut update_counter: u32 = 0;    
     let mut insert_counter: u32 = 0;
     info!("Attempting to sync: {}", &type_arg);    
     loop {
-        let res = client.get(&url).send().await;
-        match res {            
-            Ok(res) => {                
-                let res_text = match res.text().await {
-                    Ok(text) => text,
-                    Err(err) => {
-                        error!("Failed to get payload: {}", err);
-                        break;
-                    }
-                };      
-                let search_set: Result<SearchSet, serde_json::Error> = serde_json::from_str(&res_text); 
-                match search_set {
-                    Ok(search_set) => {
-                        let entries = match search_set.entry {
-                            Some(entries) => entries,
-                            None => {
-                                warn!("Could not read entries from search set.");
-                                break;
-                            }
-                        };                        
-                        for e in entries {                            
-
-                            let blaze_version = get_version(e.resource.clone());
-                            let blaze_version = match blaze_version {
-                                Some(v) => v,
-                                None => {                                    
-                                    warn!("Could not read resource version from Blaze search set entry.");
-                                    continue
-                                }
-                            };
-                                                        
-                            let resource_str = match serde_json::to_string(&e.resource) {
-                                Ok(s) => s,
-                                Err(_) => {
-                                    "{}".to_string() 
-                                }
-                            };
-
-                            match pg_versions.get(&blaze_version.resource_id) {
-                                Some(pg_version) => { //Resource is already in pg
-                                    if pg_version.version_id < blaze_version.version_id ||
-                                        pg_version.version_id > blaze_version.version_id
-                                    {
-                                        //Resource exists in pg but is outdated. 
-                                        //Add resource for batch update into pg
-                                        update_counter += 1;                                        
-                                        update_batch.push(PgUpdateItem {id: pg_version.pk_id, resource: resource_str.clone()});
-                                        //Remove all entries from pg_versions that can be found in Blaze 
-                                        //=> remaining ones need to be deleted from pg
-                                        pg_versions.remove(&blaze_version.resource_id);  
-                                    } else { //Blaze and pg versions match
-                                        pg_versions.remove(&blaze_version.resource_id);
-                                    }                                    
-                                },
-                                None => { // current resource not (yet) in pg
-                                    //Add resource for batch insert into pg
-                                        insert_counter += 1;                                    
-                                        insert_batch.push(PgInsertItem {resource: resource_str.clone()});                                    
-                                }
-                            }
-
-                            if update_counter > 0 && update_counter % batch_size == 0 {
-                                update_helper(pg_con_pool, &update_batch, table_name).await?;
-                                update_batch.clear();
-
-                            } else if insert_counter > 0 && insert_counter % batch_size == 0 {
-                                insert_helper(pg_con_pool, &insert_batch, table_name).await?;
-                                insert_batch.clear();
-
-                            }
-
-                        }
-                        // extract link to next page if exists or break
-                        let next_url = search_set.link.iter()
-                            .find(|link| link.relation == "next")
-                            .map(|link| link.url.clone());
-                
-                        if let Some(next_url) = next_url {
-                            url = next_url;
-                        } else {
-                            break;
-                        }
-                    },
-                    Err(err) => {
-                        error!("Could not deserialize JSON to SearchSet: {}", err);
-                        break;
-                    }
-                }
-            },
-            //no valid search response from Blaze
-            Err(err) => {                 
-                error!("Failed to get response from Blaze: {}", err);
+        let search_set = get_blaze_search_set(&url).await?;
+        let entries = match search_set.entry {
+            Some(entries) => entries,
+            None => {
+                warn!("Could not read entries from search set.");
                 break;
             }
+        };                        
+        for e in entries {                            
+
+            let blaze_version = get_version(e.resource.clone());
+            let blaze_version = match blaze_version {
+                Some(v) => v,
+                None => {                                    
+                    warn!("Could not read resource version from Blaze search set entry.");
+                    continue
+                }
+            };
+                                        
+            let resource_str = match serde_json::to_string(&e.resource) {
+                Ok(s) => s,
+                Err(_) => {
+                    "{}".to_string() 
+                }
+            };
+
+            match pg_versions.get(&blaze_version.resource_id) {
+                Some(pg_version) => { //Resource is already in pg
+                    if pg_version.version_id < blaze_version.version_id ||
+                        pg_version.version_id > blaze_version.version_id
+                    {
+                        //Resource exists in pg but is outdated. 
+                        //Add resource for batch update into pg
+                        update_counter += 1;                                        
+                        update_batch.push(PgUpdateItem {id: pg_version.pk_id, resource: resource_str.clone()});
+                        //Remove all entries from pg_versions that can be found in Blaze 
+                        //=> remaining ones need to be deleted from pg
+                        pg_versions.remove(&blaze_version.resource_id);  
+                    } else { //Blaze and pg versions match
+                        pg_versions.remove(&blaze_version.resource_id);
+                    }                                    
+                },
+                None => { // current resource not (yet) in pg
+                    //Add resource for batch insert into pg
+                        insert_counter += 1;                                    
+                        insert_batch.push(PgInsertItem {resource: resource_str.clone()});                                    
+                }
+            }
+
+            if update_counter > 0 && update_counter % batch_size == 0 {
+                update_helper(pg_con_pool, &update_batch, table_name).await?;
+                update_batch.clear();
+
+            } else if insert_counter > 0 && insert_counter % batch_size == 0 {
+                insert_helper(pg_con_pool, &insert_batch, table_name).await?;
+                insert_batch.clear();
+
+            }
+
+        }
+        // extract link to next page if exists or break
+        let next_url = search_set.link.iter()
+            .find(|link| link.relation == "next")
+            .map(|link| link.url.clone());
+
+        if let Some(next_url) = next_url {
+            url = next_url;
+        } else {
+            break;
         }
     }
     //insert or update the last remaining resources

@@ -31,6 +31,7 @@ pub async fn get_pg_connection_pool(pg_url: &str, num_attempts: u32) -> Result<P
     Err(err.unwrap_or_else(|| anyhow!("Failed to connect to PostgreSQL")))
 }
 
+
 pub async fn check_blaze_connection(blaze_base_url: &str, num_attempts: u32) -> Result<bool, anyhow::Error> {
     info!("Attempting to connect to Blaze");
     
@@ -57,6 +58,8 @@ pub async fn check_blaze_connection(blaze_base_url: &str, num_attempts: u32) -> 
 
 }
 
+
+//function that checks wheter a given list of required tables exist in pg
 pub async fn pred_tables_exist(pg_con_pool: &PgPool, table_names: &Vec<&str>) -> Result<bool, anyhow::Error> {
     info!("Checking whether PostgreSQL tables exist");    
     
