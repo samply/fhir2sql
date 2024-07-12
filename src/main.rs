@@ -341,9 +341,9 @@ pub async fn run_sync(pg_con_pool: &PgPool, config: &Config) -> Result<(), anyho
 
     let table_names: Vec<&str> = vec!["specimen", "patients", "observations", "conditions"];
     
-    //check preconditions for sync
-    //@todo: move num_attempts param somewhere else?
-    let blaze_available = check_blaze_connection(&config.blaze_base_url, 10).await?;
+    //check preconditions for sync    
+    let blaze_available = check_blaze_connection(&config.blaze_base_url,
+         config.blaze_num_connection_attempts).await?;
     let all_tables_exist = pred_tables_exist(pg_con_pool, &table_names).await?;
 
     if blaze_available && all_tables_exist {
