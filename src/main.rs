@@ -4,7 +4,7 @@ mod graceful_shutdown;
 use db_utils::*;
 use tokio::select;
 use tokio::time::{interval, Duration, sleep_until, Instant};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 use anyhow::bail;
 use reqwest::Client;
@@ -163,6 +163,46 @@ pub async fn delete_helper(pg_con_pool: &PgPool, items: &[i32], table_name: &str
     Ok(())
 }
 
+// get the number of rows of a given pg table
+pub async fn get_num_rows(pg_con_pool: &PgPool, table_name: &str) -> Result<i64,anyhow::Error> {
+    let query = format!("SELECT COUNT(*) FROM {}", table_name);
+    let row = sqlx::query(query.as_str())
+        .fetch_one(pg_con_pool)
+        .await?;
+    let count: i64 = row.try_get(0)?;
+    Ok(count)
+}
+
+//get the number of resources of a specific type from blaze
+pub async fn get_blaze_resource_count(blaze_base_url: &str, type_arg: &str) -> Result<i64, anyhow::Error> {
+    let client = Client::new();
+    let res = client.get(format!("{}/fhir/{}?_count=0", blaze_base_url, type_arg)).send().await;
+    match res {            
+        Ok(res) => {                
+            let res_text = match res.text().await {
+                Ok(text) => text,
+                Err(err) => {
+                    error!("Failed to get payload: {}", err);
+                    "".to_string()
+                }
+            };      
+            let search_set: Result<SearchSet, serde_json::Error> = serde_json::from_str(&res_text); 
+            match search_set {
+                Ok(search_set) => {
+                    Ok(search_set.total as i64)
+                } Err(err) => {
+                    error!("Could not deserialize JSON to SearchSet: {}", err);
+                    Err(anyhow::Error::new(err))
+                }
+            }
+        },
+        //no valid search response from Blaze
+        Err(err) => {                 
+            error!("Failed to get response from Blaze: {}", err);
+            Err(anyhow::Error::new(err))
+        }
+    }
+}
 
 /// Synchronizes resources from Blaze to PostgreSQL
 ///
@@ -181,8 +221,8 @@ pub async fn delete_helper(pg_con_pool: &PgPool, items: &[i32], table_name: &str
 /// # Returns
 ///
 /// A `Result` indicating whether the synchronization was successful. If an error occurs, it will be returned as an `anyhow::Error`.
-async fn sync(
-        base_url: &str, 
+async fn sync_blaze_2_pg(
+        blaze_base_url: &str, 
         pg_con_pool: &PgPool, 
         type_arg: &str, 
         batch_size: u32, 
@@ -208,7 +248,7 @@ async fn sync(
     
     let client = Client::new();
     let mut url: String = format!("{}/fhir/{}?_count={}&_history=current",
-        base_url, type_arg, page_resource_count);
+        blaze_base_url, type_arg, page_resource_count);
     let mut update_counter: u32 = 0;    
     let mut insert_counter: u32 = 0;
     info!("Attempting to sync: {}", &type_arg);    
@@ -263,6 +303,8 @@ async fn sync(
                                         //Remove all entries from pg_versions that can be found in Blaze 
                                         //=> remaining ones need to be deleted from pg
                                         pg_versions.remove(&blaze_version.resource_id);  
+                                    } else { //Blaze and pg versions match
+                                        pg_versions.remove(&blaze_version.resource_id);
                                     }                                    
                                 },
                                 None => { // current resource not (yet) in pg
@@ -309,42 +351,57 @@ async fn sync(
     }
     //insert or update the last remaining resources
     if update_batch.len() > 0 {
+        update_counter += update_batch.len() as u32;
         update_helper(pg_con_pool, &update_batch, table_name).await?;
     }
     if insert_batch.len() > 0 {
+        insert_counter += insert_batch.len() as u32;
         insert_helper(pg_con_pool, &insert_batch, table_name).await?;       
     }
     //remove rows from pg that were not encountered in blaze
     let delete_ids: Vec<i32> = pg_versions.values().map(|value| value.pk_id).collect();
-    if delete_ids.len() > 0 {
+    if delete_ids.len() > 0 {        
         delete_helper(pg_con_pool, &delete_ids, table_name).await?;
-    }    
+    }
+
+    info!("Updated {} rows", update_counter);
+    info!("Inserted {} rows", insert_counter);
+    info!("Deleted {} rows", delete_ids.len() as u32);
+
+    //compare total entry counts between blaze and pg
+    let row_count = get_num_rows(pg_con_pool, table_name).await?;
+    let resource_count = get_blaze_resource_count(blaze_base_url, type_arg).await?;
+    if row_count != resource_count {
+        warn!("{} entry counts do not match between Blaze and PostgreSQL", type_arg);
+    } else {
+        info!("{} entry counts match between Blaze and PostgreSQL \u{2705}", type_arg);
+    }
+
     Ok(())
 }
 
 
-//@todo: add check whether to number of blaze resources exactly matches the number of resources in pg after inserts/updates/deletes
 pub async fn run_sync(pg_con_pool: &PgPool, blaze_base_url: &str) -> Result<(), anyhow::Error>{
     let type_args: Vec<&str> = vec!["Specimen", "Patient", "Observation", "Condition"];
 
-    let page_resource_count = 1000; //the number of resources to return per page by blaze
+    let page_resource_count = 5000; //the number of resources to return per page by blaze
     let batch_size = 10000; //the number of resources to insert or update per batch in PostgreSQL
     let table_names: Vec<&str> = vec!["specimen", "patients", "observations", "conditions"];
     
     //check preconditions for sync
-    //@todo: move param somewhere else?
+    //@todo: move num_attempts param somewhere else?
     let blaze_available = check_blaze_connection(blaze_base_url, 10).await?;
     let all_tables_exist = pred_tables_exist(pg_con_pool, &table_names).await?;
 
     if blaze_available && all_tables_exist {
-        info!("All tables found as expected \u{2705}");
+        info!("All tables found as expected");
         for type_arg in type_args {
-            sync(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
+            sync_blaze_2_pg(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
         }
     } else if blaze_available && !all_tables_exist {
         create_tables(pg_con_pool).await?;
         for type_arg in type_args {
-            sync(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
+            sync_blaze_2_pg(&blaze_base_url, pg_con_pool, type_arg, batch_size, page_resource_count).await?;
         }
     }
     Ok(())
@@ -384,6 +441,7 @@ async fn main() -> Result<(), anyhow::Error>{
     }
 
     // main loop
+    info!("Entering regular sync schedule");
     let mut interval = interval(Duration::from_secs(60)); // execute every 1 minute
     //@todo: move target_time param somewhere else?
     let target_time = match NaiveTime::from_hms_opt(3, 0, 0) {

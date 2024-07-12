@@ -17,7 +17,7 @@ pub async fn get_pg_connection_pool(pg_url: &str, num_attempts: u32) -> Result<P
             .await
         {
             Ok(pg_con_pool) => {
-                info!("PostgreSQL connection successfull \u{2705}");
+                info!("PostgreSQL connection successfull");
                 return Ok(pg_con_pool)
             },
             Err(e) => {
@@ -42,7 +42,7 @@ pub async fn check_blaze_connection(blaze_base_url: &str, num_attempts: u32) -> 
         info!("Attempt to connect to Blaze {} of {}", attempts + 1, num_attempts);
         match client.get(format!("{}/health", blaze_base_url)).send().await {
             Ok(_) => {
-                info!("Blaze connection successfull \u{2705}");
+                info!("Blaze connection successfull");
                 return Ok(true)
             },
             Err(e) => {
