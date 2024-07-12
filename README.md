@@ -1,5 +1,3 @@
-Here is a concise and catchy README.md for your code base:
-
 **FHIR2SQL**
 =====================
 
