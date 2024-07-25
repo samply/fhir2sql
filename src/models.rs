@@ -33,7 +33,7 @@ pub struct ResourceVersion {
     pub version_id: i64
 }
 
-pub struct BTreeMapValue {
+pub struct PgVersion {
     pub pk_id: i32, //pg row primary key. Needed for upsert
     pub version_id: i64 //resource version_id
 }

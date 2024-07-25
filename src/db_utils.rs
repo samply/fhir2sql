@@ -85,7 +85,7 @@ pub async fn create_tables(pg_con_pool: &PgPool) -> Result<(), anyhow::Error> {
     info!("Creating PostgreSQL tables");
 
     let create_tables_queries = vec![
-        "CREATE TABLE IF NOT EXISTS patients (
+        "CREATE TABLE IF NOT EXISTS patient (
             id SERIAL PRIMARY KEY,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -97,13 +97,13 @@ pub async fn create_tables(pg_con_pool: &PgPool) -> Result<(), anyhow::Error> {
             last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             resource JSONB NOT NULL
         )",
-        "CREATE TABLE IF NOT EXISTS conditions (
+        "CREATE TABLE IF NOT EXISTS condition (
             id SERIAL PRIMARY KEY,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             resource JSONB NOT NULL
         )",
-        "CREATE TABLE IF NOT EXISTS observations (
+        "CREATE TABLE IF NOT EXISTS observation (
             id SERIAL PRIMARY KEY,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -117,7 +117,7 @@ pub async fn create_tables(pg_con_pool: &PgPool) -> Result<(), anyhow::Error> {
             END;
             $$ LANGUAGE plpgsql;",
         "CREATE TRIGGER update_last_updated_trigger
-            BEFORE UPDATE ON patients
+            BEFORE UPDATE ON patient
             FOR EACH ROW
             EXECUTE PROCEDURE update_last_updated();",
         "CREATE TRIGGER update_last_updated_trigger
@@ -125,11 +125,11 @@ pub async fn create_tables(pg_con_pool: &PgPool) -> Result<(), anyhow::Error> {
             FOR EACH ROW
             EXECUTE PROCEDURE update_last_updated();",
         "CREATE TRIGGER update_last_updated_trigger
-            BEFORE UPDATE ON conditions
+            BEFORE UPDATE ON condition
             FOR EACH ROW
             EXECUTE PROCEDURE update_last_updated();",
         "CREATE TRIGGER update_last_updated_trigger
-            BEFORE UPDATE ON observations
+            BEFORE UPDATE ON observation
             FOR EACH ROW
             EXECUTE PROCEDURE update_last_updated();",
     ];
