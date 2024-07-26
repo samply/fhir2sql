@@ -204,7 +204,15 @@ async fn sync_blaze_2_pg(
                 break;
             }
         };                        
-        for e in entries {                            
+        for e in entries {
+
+            let resource_str = match serde_json::to_string(&e.resource) {
+                Ok(resource) => resource,
+                Err(err) => {
+                    warn!("Could not read resource from search set entry: {}", err);
+                    continue
+                }
+            };                            
 
             let blaze_version = get_version(e.resource.clone());
             let blaze_version = match blaze_version {
@@ -214,8 +222,6 @@ async fn sync_blaze_2_pg(
                     continue
                 }
             };
-
-            let resource_str = serde_json::to_string(&e.resource).unwrap_or("{}".to_string());
 
             match pg_versions.get(&blaze_version.resource_id) {
                 Some(pg_version) => { //Resource is already in pg
@@ -358,7 +364,7 @@ async fn main() -> Result<(), anyhow::Error>{
             .ok_or_else(|| anyhow!("Invalid target time"))?
     };
 
-    info!("fhir2sql started"); //@todo: replace with proper banner
+    info!("🔥2🐘 fhir2sql started"); //@todo: replace with proper banner
     
     let pg_url = format!("postgresql://{}:{}@{}:{}/{}", 
         config.pg_username, 
