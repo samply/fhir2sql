@@ -52,7 +52,7 @@ pub async fn check_blaze_connection(blaze_base_url: &str, num_attempts: u32) -> 
             }
         }
         attempts += 1;
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await; //@todo: move param somewhere else?
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await; //@todo: move param somewhere else?
     }
     Err(err.unwrap_or_else(|| anyhow!("Failed to connect to Blaze")))
 
