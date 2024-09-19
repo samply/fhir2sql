@@ -30,6 +30,7 @@ pub struct Config {
     blaze_page_resource_count: u32,
     blaze_num_connection_attempts: u32,
     target_time: NaiveTime,
+    pkg_version: String
 }
 
 // read id and version_id from a resource if possible
@@ -361,10 +362,11 @@ async fn main() -> Result<(), anyhow::Error>{
         blaze_page_resource_count: 5000,
         blaze_num_connection_attempts: 20,
         target_time: NaiveTime::from_hms_opt(3, 0, 0)
-            .ok_or_else(|| anyhow!("Invalid target time"))?
+            .ok_or_else(|| anyhow!("Invalid target time"))?,
+        pkg_version: option_env!("CARGO_PKG_VERSION").unwrap_or(" unknown").to_string()
     };
 
-    info!("🔥2🐘 fhir2sql started"); //@todo: replace with proper banner
+    info!("🔥2🐘 fhir2sql v{} started", config.pkg_version);
     
     let pg_url = format!("postgresql://{}:{}@{}:{}/{}", 
         config.pg_username, 
@@ -372,6 +374,7 @@ async fn main() -> Result<(), anyhow::Error>{
         config.pg_host, 
         config.pg_port, 
         config.pg_dbname);
+
     let pg_con_pool = get_pg_connection_pool(&pg_url, 10).await?;
     
     info!("Running initial sync");
