@@ -295,7 +295,7 @@ async fn sync_blaze_2_pg(
     if row_count != resource_count {
         warn!("{} entry counts do not match between Blaze and PostgreSQL", type_arg);
     } else {
-        info!("{} entry counts match between Blaze and PostgreSQL \u{2705}", type_arg);
+        info!("{} entry counts match between Blaze and PostgreSQL \u{2705} ({})", type_arg, row_count);
     }
 
     Ok(())
