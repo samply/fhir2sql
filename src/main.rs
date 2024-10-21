@@ -269,12 +269,10 @@ async fn sync_blaze_2_pg(
         }
     }
     //insert or update the last remaining resources
-    if update_batch.len() > 0 {
-        update_counter += update_batch.len() as u32;
+    if update_batch.len() > 0 {        
         update_helper(pg_con_pool, &update_batch, &table_name).await?;
     }
-    if insert_batch.len() > 0 {
-        insert_counter += insert_batch.len() as u32;
+    if insert_batch.len() > 0 {        
         insert_helper(pg_con_pool, &insert_batch, &table_name).await?;       
     }
     //remove rows from pg that were not encountered in blaze
